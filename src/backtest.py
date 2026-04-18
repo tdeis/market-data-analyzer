@@ -1,46 +1,74 @@
 import numpy as np
 import pandas as pd
-from scipy.optimize import minimize
 
-from src.portfolio import portfolio_return, portfolio_volatility, negative_sharpe
-
-
-def optimize_portfolio(mean_returns, cov_matrix, bounds, constraints, init_guess):
-    result = minimize(
-        negative_sharpe,
-        init_guess,
-        args=(mean_returns, cov_matrix),
-        method="SLSQP",
-        bounds=bounds,
-        constraints=constraints,
-    )
-    return result.x
+from src.optimizer import optimize_portfolio
+from src.portfolio import negative_sharpe, negative_sharpe_defensive
+from src.regime import detect_regime
 
 
-def run_backtest(prices, window=60):
+def _validate(prices):
+    if not isinstance(prices, pd.DataFrame):
+        raise TypeError("prices must be DataFrame")
+    if prices.isnull().values.any():
+        raise ValueError("NaNs in price data")
+    if not isinstance(prices.index, pd.DatetimeIndex):
+        raise ValueError("Index must be DatetimeIndex")
+
+
+def run_backtest(
+    prices, window=60, rebalance_freq=21, transaction_cost=0.001, max_weight=0.4
+):
+
+    _validate(prices)
+
     returns = prices.pct_change().dropna()
 
-    tickers = prices.columns
-    num_assets = len(tickers)
+    if len(returns) <= window:
+        raise ValueError("Not enough data")
 
-    bounds = tuple((0, 1) for _ in range(num_assets))
-    constraints = {"type": "eq", "fun": lambda w: np.sum(w) - 1}
-    init_guess = np.array([1 / num_assets] * num_assets)
+    n = returns.shape[1]
 
-    portfolio_returns = []
+    bounds = tuple((0, max_weight) for _ in range(n))
+    constraints = ({"type": "eq", "fun": lambda w: np.sum(w) - 1},)
 
-    for i in range(window, len(returns) - 1):
-        train_data = returns.iloc[i - window : i]
+    regime = detect_regime(prices)
 
-        mean_returns = train_data.mean()
-        cov_matrix = train_data.cov()
+    init = np.ones(n) / n
+    prev_w = init.copy()
 
-        weights = optimize_portfolio(
-            mean_returns, cov_matrix, bounds, constraints, init_guess
-        )
+    r_vals = returns.values
+    idx = returns.index
 
-        next_return = np.dot(weights, returns.iloc[i + 1])
+    out_returns = []
+    out_dates = []
+    weights_hist = []
 
-        portfolio_returns.append(next_return)
+    for i in range(window, len(r_vals) - 1):
 
-    return pd.Series(portfolio_returns)
+        train = r_vals[i - window : i]
+
+        mu = train.mean(axis=0)
+        cov = np.cov(train, rowvar=False)
+
+        obj = negative_sharpe if regime.iloc[i] == "bull" else negative_sharpe_defensive
+
+        if i % rebalance_freq == 0:
+            w = optimize_portfolio(mu, cov, bounds, constraints, init, obj)
+        else:
+            w = prev_w
+
+        turnover = np.sum(np.abs(w - prev_w))
+        cost = transaction_cost * turnover
+
+        ret = np.dot(w, r_vals[i + 1]) - cost
+
+        out_returns.append(ret)
+        out_dates.append(idx[i + 1])
+        weights_hist.append(w)
+
+        prev_w = w
+
+    return (
+        pd.Series(out_returns, index=out_dates, name="strategy"),
+        pd.DataFrame(weights_hist, index=out_dates, columns=prices.columns),
+    )
